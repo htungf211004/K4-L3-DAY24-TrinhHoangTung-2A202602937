@@ -1,4 +1,4 @@
-# Verification — CP1, CP2 và CP3a–e
+# Verification — CP1, CP2, CP3a–e và CP4
 
 Ngày kiểm tra: 12/10/2026.
 
@@ -222,3 +222,77 @@ Giới hạn: hash chain trong một file không chứng minh được việc xo
 `reports/attack-before.log` giữ nguyên SHA-256 `D97AF1B21F949B58769D2259649885C9E1142AFAD18F5D446FE0F13359A54DAC`. `git diff --check` không báo lỗi nội dung; Git có cảnh báo chuyển LF sang CRLF cho `injection-corpus.md` từ thay đổi CP3d.
 
 CP3e chỉ sửa `agent/ledger.py`, bổ sung báo cáo có sẵn và append vào `reports/ledger.jsonl` theo yêu cầu. Ledger đang bị `.gitignore` bỏ qua; khi nộp cần thêm đúng file evidence bằng `git add -f reports/ledger.jsonl`. Chưa stage hay commit. Dừng sau CP3e, chưa làm CP4 hoặc CP5.
+
+## CP4 — Supply chain và token giả
+
+Đã đọc hướng dẫn Bước 5 cùng `README.md`, `CHECKPOINTS.md`, `RUBRIC.md`, `RULES.md`, `SUBMISSION.md` và `tests/test_supply_chain.py`. Chỉ làm CP4 trong lượt này.
+
+Môi trường: Python **3.11.9**, pip **24.0**, pip-tools **7.6.2**, pre-commit **4.6.2**, Gitleaks **8.30.1**. Gitleaks đã có trong PATH; không cần chỉnh PATH ở lượt này.
+
+### Scanner
+
+```powershell
+gitleaks version
+gitleaks git --config .gitleaks.toml --redact --verbose .
+gitleaks dir --config .gitleaks.toml --redact --verbose .
+```
+
+`version` in `8.30.1`. Quét lịch sử lần đầu và sau sửa allowlist đều quét **8 commit**, tìm **1 finding**, exit code **1** đúng mong đợi: commit `1bdd849922156c868a5ee9293d68f5b72e242d2c`, file `lab-fake-secret.txt:1`, rule `lab24-synthetic-token`. Finding và Secret đều được redact.
+
+Quét file hiện tại lần đầu báo **1 finding**, exit code **1**, tại `.venv/Lib/site-packages/setuptools/_distutils/msvccompiler.py:45`, rule `generic-api-key`. Đã mở dòng đó: biến `RegEnumKey` nhận hàm cùng tên từ module `win32api`; đây là phép gán hàm trong thư viện, bị báo nhầm. Chỉ thêm allowlist `^\.venv[\\/]` cho `.venv/` ở gốc repo vào `.gitleaks.toml`, giữ các rule mặc định và rule token giả. Chạy lại quét file: **`no leaks found`**, exit code **0**. Kiểm regex trong bộ nhớ xác nhận khớp cả dấu `/` và `\`, không khớp `agent/runner.py` hoặc `lab-fake-secret.txt`.
+
+Chi tiết finding, phạm vi bỏ qua và cách xử lý nếu là credential thật nằm trong `reports/secrets-incident.md`. Không in hoặc chép nguyên token giả.
+
+### Lock và cài dependency
+
+```powershell
+.venv\Scripts\python.exe -m piptools compile --generate-hashes -o requirements.lock requirements.txt
+.venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock --force-reinstall
+.venv\Scripts\python.exe -m pip check
+```
+
+Compile và cài từ lock đều exit code **0**. Dùng `--force-reinstall` để pip thực sự kiểm hash của artifact tải/cached, kể cả khi package đã cài. `pip check` in **`No broken requirements found.`**. Pip báo có phiên bản mới nhưng không nâng pip ngoài yêu cầu.
+
+Lock có **11 package**, mọi block đều có hash SHA-256; đối chiếu bằng `importlib.metadata` thấy phiên bản đã cài khớp lock:
+
+| Package | Phiên bản |
+|---|---|
+| certifi | 2026.7.22 |
+| charset-normalizer | 3.5.2 |
+| colorama | 0.4.6 |
+| idna | 3.20 |
+| iniconfig | 2.3.1 |
+| packaging | 26.3 |
+| pluggy | 1.6.0 |
+| pygments | 2.21.0 |
+| pytest | 9.1.1 |
+| requests | 2.34.2 |
+| urllib3 | 2.8.0 |
+
+Lock sinh trong môi trường Windows/Python 3.11; chưa kiểm cài trên WSL/Linux hoặc phiên bản Python khác. pip-tools cảnh báo `--strip-extras` sẽ đổi mặc định ở bản 8; lệnh compile vẫn thành công và requirements của lab không dùng extras.
+
+### Hook và test
+
+Đã tạo `.pre-commit-config.yaml`: repo chính thức Gitleaks, `rev: v8.30.1`, hook `gitleaks-system`, `pass_filenames: false`, args chọn `.gitleaks.toml`.
+
+```powershell
+.venv\Scripts\python.exe -m pre_commit install
+.venv\Scripts\python.exe -m pre_commit run --all-files
+.venv\Scripts\python.exe -m pytest tests/test_supply_chain.py -v --basetemp=.pytest_tmp
+```
+
+Install in **`pre-commit installed at .git\hooks\pre-commit`**, exit code **0**. Run hook in **`Detect hardcoded secrets ... Passed`**, exit code **0**. Hook chính thức dùng `--staged`; chưa stage thay đổi CP4, nên kết quả này không thay cho quét toàn bộ file hiện tại và lịch sử bằng hai lệnh scanner riêng.
+
+Test supply chain: **3 passed in 0.03s**, **0 skipped**, exit code **0**. Ba test kiểm hook pin/pass_filenames, lock có hash và incident note nêu commit/rule/rotate. Không sửa test bắt buộc.
+
+### Lỗi gặp và cách xử lý
+
+- Lệnh xem phiên bản `piptools --version` không được hỗ trợ; dùng `importlib.metadata.version('pip-tools')` để đọc phiên bản cài đặt.
+- Compile lần đầu trong sandbox lỗi `PermissionError: [WinError 5]` khi tạo cache tại `C:\Users\Htungf\AppData\Local\pip-tools`. Chạy lại cùng lệnh với quyền được cấp để ghi cache và truy cập PyPI; thành công.
+- `pre_commit install` lần đầu trong sandbox bị chặn cache `C:\Users\Htungf\.cache\pre-commit`. Chạy lại với quyền được cấp để ghi cache, cài `.git/hooks/pre-commit` và tải repo hook; install/run đều thành công.
+- Cài từ lock lần đầu trong sandbox báo `No matching distribution found for certifi==2026.7.22`. Chạy lại cùng lệnh với quyền truy cập package index; cài lại đủ 11 package và kiểm hash thành công. Không hạ phiên bản hoặc bỏ kiểm hash để vượt lỗi.
+- Quét file sau khi viết báo cáo báo thêm **2 finding** `generic-api-key`, exit code **1**, do hai báo cáo trích nguyên phép gán thư viện bị báo nhầm. Đã đổi đoạn trích thành mô tả bằng lời, không mở rộng allowlist. Quét lại toàn bộ file hiện tại sau sửa: **`no leaks found`**, exit code **0**.
+
+Đã kiểm ledger vẫn có **51 dòng**, `verify()` trả **`True`**; SHA-256 của `attack-before.log` vẫn là `D97AF1B21F949B58769D2259649885C9E1142AFAD18F5D446FE0F13359A54DAC`.
+
+CP4 tạo đúng hai file được yêu cầu: `.pre-commit-config.yaml`, `requirements.lock`; sửa `.gitleaks.toml` theo ngoại lệ false positive và cập nhật hai báo cáo có sẵn. Cache công cụ, hook Git và thư mục test tạm không phải file nộp bài. Chưa stage/commit, chưa chạy toàn bộ test, chưa tạo log after hoặc viết mapping/DPIA của CP5. Dừng sau CP4 để người dùng quyết định trước CP5.
