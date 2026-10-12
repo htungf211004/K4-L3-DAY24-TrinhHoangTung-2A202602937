@@ -59,10 +59,48 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
+
+from agent import ledger, pii, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+
+_ROOT_SCOPES = ("search_docs", "read_customer")
+_TICKET_FILE = re.compile(r"ticket-([0-9]+)(?:b)?\.md")
+
+
+def _run_b(ticket_ids: list[int], authorize, run_id: str) -> list[dict]:
+    """Chỉ nhận ID từ tên file; tìm khách qua related_tickets của dữ liệu gốc."""
+    if not ticket_ids:
+        return []
+    arguments = {"ticket_ids": ticket_ids}
+    # Kiểm trước cả việc mở file để tra liên kết, không đọc rồi mới lọc.
+    if not authorize(
+        "read_customer", run_id, ("read_customer",), "restricted",
+        "support-reply", arguments, delegation_depth=1,
+        parent_scopes=_ROOT_SCOPES, stage="customer-lookup",
+    ):
+        return []
+    customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    related_ids = sorted({
+        customer["customer_id"] for customer in customers
+        if any(ticket_id in ticket_ids for ticket_id in customer.get("related_tickets", []))
+    })
+    collected = []
+    for customer_id in related_ids:
+        if authorize(
+            "read_customer", run_id, ("read_customer",), "restricted",
+            "support-reply", {"customer_id": customer_id}, delegation_depth=1,
+            parent_scopes=_ROOT_SCOPES,
+        ):
+            collected.append(tools.read_customer(customer_id))
+    return collected
 
 
 class RunnerScaffoldPending(NotImplementedError):
@@ -71,4 +109,75 @@ class RunnerScaffoldPending(NotImplementedError):
 
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = Path(log_dir) / "ledger.jsonl" if log_dir is not None else DEFAULT_LEDGER_PATH
+    agent_id = f"lab24-agent-{uuid4().hex}"
+    run_a_id = f"run-a-{uuid4().hex}"
+    run_b_id = f"run-b-{uuid4().hex}"
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+
+    def authorize(tool, run_id, scopes, classification, purpose, arguments,
+                  egress_enabled=False, delegation_depth=0, parent_scopes=(),
+                  stage="tool-call"):
+        context = policy.PolicyContext(
+            data_classification=classification,
+            request_purpose=purpose,
+            agent_owner=f"{agent_id}/{run_id}",
+            delegation_depth=delegation_depth,
+            egress_enabled=egress_enabled,
+            principal_id=principal_id,
+            requested_tool=tool,
+            agent_scopes=scopes,
+            parent_scopes=parent_scopes,
+            expires_at=expires_at,
+        )
+        allowed, reason = policy.check(context)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("policy decision must include a reason")
+        args_json = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        ledger.append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "on_behalf_of": principal_id,
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "expires_at": expires_at,
+            "tool": tool,
+            "args_hash": hashlib.sha256(args_json.encode("utf-8")).hexdigest(),
+            "classification": classification,
+            "request_purpose": purpose,
+            "delegation_depth": delegation_depth,
+            "agent_scopes": list(scopes),
+            "parent_scopes": list(parent_scopes),
+            "egress_enabled": egress_enabled,
+            "stage": stage,
+            "decision": "allow" if allowed else "deny",
+            "reason": reason,
+        }, ledger_path)
+        return allowed
+
+    # Run A chỉ tìm ticket. Nội dung thô không được truyền cho Run B.
+    if not authorize(
+        "search_docs", run_a_id, ("search_docs",), "internal",
+        "summarize-tickets", {"query": message},
+    ):
+        return "Không được phép tìm ticket với quyền hiện tại."
+    docs = tools.search_docs(message)
+    ticket_ids = sorted({
+        int(match.group(1)) for doc in docs
+        if (match := _TICKET_FILE.fullmatch(doc["id"])) is not None
+    })
+    has_injection = llm.find_injection("\n\n".join(doc["text"] for doc in docs)) is not None
+    safe_docs = [{"id": doc["id"], "text": pii.redact(doc["text"])} for doc in docs]
+    answer = llm.summarize(safe_docs)
+
+    # Run B chỉ tra khách liên quan; không dùng mã khách hay URL trong ticket.
+    collected = _run_b(ticket_ids, authorize, run_b_id)
+    if has_injection:
+        url = "http://127.0.0.1:10024/reconcile"
+        body = {"records": collected}
+        if authorize(
+            "http_post", run_b_id, ("read_customer",), "restricted",
+            "support-reply", {"url": url, "body": body}, egress_enabled=True,
+            delegation_depth=1, parent_scopes=_ROOT_SCOPES,
+        ):
+            tools.http_post(url, body)
+    return answer

@@ -34,7 +34,12 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+PRINCIPALS_FILE = Path(__file__).resolve().parent.parent / "data" / "principals.json"
 
 
 @dataclass(frozen=True)
@@ -52,4 +57,56 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    if context.data_classification not in ("public", "internal", "restricted"):
+        return False, "unknown data classification"
+    if not isinstance(context.egress_enabled, bool):
+        return False, "egress_enabled must be a boolean"
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data cannot be used with egress enabled"
+
+    if not isinstance(context.agent_owner, str) or not context.agent_owner.strip():
+        return False, "agent identity is missing"
+    if type(context.delegation_depth) is not int or context.delegation_depth < 0:
+        return False, "delegation depth must be a non-negative integer"
+    if not isinstance(context.principal_id, str) or not context.principal_id:
+        return False, "principal identity is missing"
+    try:
+        principals = json.loads(PRINCIPALS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, "trusted principal registry is unavailable"
+    if not isinstance(principals, dict):
+        return False, "trusted principal registry is invalid"
+    principal = principals.get(context.principal_id)
+    if not isinstance(principal, dict):
+        return False, "unknown principal"
+
+    allowed_tools = principal.get("allowed_tools")
+    purposes = principal.get("purposes")
+    if (not isinstance(allowed_tools, list) or not isinstance(purposes, list)
+            or not all(isinstance(item, str) for item in allowed_tools + purposes)):
+        return False, "principal permissions are invalid"
+    if context.request_purpose not in purposes:
+        return False, "purpose is not allowed for this principal"
+    if context.requested_tool not in allowed_tools:
+        return False, "tool is not allowed for this principal"
+    if (not isinstance(context.agent_scopes, tuple)
+            or not all(isinstance(scope, str) for scope in context.agent_scopes)
+            or context.requested_tool not in context.agent_scopes):
+        return False, "tool is outside agent scopes"
+    if context.delegation_depth > 0:
+        if (not isinstance(context.parent_scopes, tuple)
+                or not all(isinstance(scope, str) for scope in context.parent_scopes)
+                or context.requested_tool not in context.parent_scopes):
+            return False, "delegated tool is outside parent scopes"
+
+    if not isinstance(context.expires_at, str) or not context.expires_at:
+        return False, "UTC expiry is missing"
+    try:
+        expires_at = datetime.fromisoformat(context.expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False, "expiry is not a valid ISO-8601 timestamp"
+    if expires_at.tzinfo is None or expires_at.utcoffset() != timedelta(0):
+        return False, "expiry must include a UTC timezone"
+    if expires_at <= datetime.now(timezone.utc):
+        return False, "agent run has expired"
+    return True, "principal, purpose, tool, scopes and UTC expiry are valid"
