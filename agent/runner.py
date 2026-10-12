@@ -75,10 +75,29 @@ _ROOT_SCOPES = ("search_docs", "read_customer")
 _TICKET_FILE = re.compile(r"ticket-([0-9]+)(?:b)?\.md")
 
 
-def _run_b(ticket_ids: list[int], authorize, run_id: str) -> list[dict]:
+def _run_a(message: str, llm, authorize, run_id: str) -> tuple[list[int], str, bool]:
+    """Đọc ticket, che PII khi tóm tắt; chỉ xuất ID từ tên file và cờ injection."""
+    if not authorize(
+        "search_docs", run_id, ("search_docs",), "internal",
+        "summarize-tickets", {"query": message},
+    ):
+        return [], "Không được phép tìm ticket với quyền hiện tại.", False
+    docs = tools.search_docs(message)
+    ticket_ids = sorted({
+        int(match.group(1)) for doc in docs
+        if (match := _TICKET_FILE.fullmatch(doc["id"])) is not None
+    })
+    has_injection = llm.find_injection("\n\n".join(doc["text"] for doc in docs)) is not None
+    safe_docs = [{"id": doc["id"], "text": pii.redact(doc["text"])} for doc in docs]
+    return ticket_ids, llm.summarize(safe_docs), has_injection
+
+
+def _run_b(ticket_ids: list[int], authorize, run_id: str) -> None:
     """Chỉ nhận ID từ tên file; tìm khách qua related_tickets của dữ liệu gốc."""
+    if not isinstance(ticket_ids, list) or any(type(item) is not int or item < 0 for item in ticket_ids):
+        raise ValueError("Run B requires a list of non-negative integer ticket IDs")
     if not ticket_ids:
-        return []
+        return
     arguments = {"ticket_ids": ticket_ids}
     # Kiểm trước cả việc mở file để tra liên kết, không đọc rồi mới lọc.
     if not authorize(
@@ -86,21 +105,20 @@ def _run_b(ticket_ids: list[int], authorize, run_id: str) -> list[dict]:
         "support-reply", arguments, delegation_depth=1,
         parent_scopes=_ROOT_SCOPES, stage="customer-lookup",
     ):
-        return []
+        return
     customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
     related_ids = sorted({
         customer["customer_id"] for customer in customers
         if any(ticket_id in ticket_ids for ticket_id in customer.get("related_tickets", []))
     })
-    collected = []
     for customer_id in related_ids:
         if authorize(
             "read_customer", run_id, ("read_customer",), "restricted",
             "support-reply", {"customer_id": customer_id}, delegation_depth=1,
             parent_scopes=_ROOT_SCOPES,
         ):
-            collected.append(tools.read_customer(customer_id))
-    return collected
+            # Hồ sơ được đọc trong Run B, không chuyển sang lượt kiểm gửi.
+            tools.read_customer(customer_id)
 
 
 class RunnerScaffoldPending(NotImplementedError):
@@ -154,30 +172,14 @@ def handle(message: str, llm, log_dir: Path | None = None,
         }, ledger_path)
         return allowed
 
-    # Run A chỉ tìm ticket. Nội dung thô không được truyền cho Run B.
-    if not authorize(
-        "search_docs", run_a_id, ("search_docs",), "internal",
-        "summarize-tickets", {"query": message},
-    ):
-        return "Không được phép tìm ticket với quyền hiện tại."
-    docs = tools.search_docs(message)
-    ticket_ids = sorted({
-        int(match.group(1)) for doc in docs
-        if (match := _TICKET_FILE.fullmatch(doc["id"])) is not None
-    })
-    has_injection = llm.find_injection("\n\n".join(doc["text"] for doc in docs)) is not None
-    safe_docs = [{"id": doc["id"], "text": pii.redact(doc["text"])} for doc in docs]
-    answer = llm.summarize(safe_docs)
-
-    # Run B chỉ tra khách liên quan; không dùng mã khách hay URL trong ticket.
-    collected = _run_b(ticket_ids, authorize, run_b_id)
+    ticket_ids, answer, has_injection = _run_a(message, llm, authorize, run_a_id)
+    _run_b(ticket_ids, authorize, run_b_id)
     if has_injection:
         url = "http://127.0.0.1:10024/reconcile"
-        body = {"records": collected}
-        if authorize(
+        # Chỉ xin quyền bằng URL. Rule restricted + egress ghi deny vào ledger.
+        authorize(
             "http_post", run_b_id, ("read_customer",), "restricted",
-            "support-reply", {"url": url, "body": body}, egress_enabled=True,
+            "support-reply", {"url": url}, egress_enabled=True,
             delegation_depth=1, parent_scopes=_ROOT_SCOPES,
-        ):
-            tools.http_post(url, body)
+        )
     return answer

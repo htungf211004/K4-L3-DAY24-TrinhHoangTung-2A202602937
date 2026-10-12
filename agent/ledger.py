@@ -1,6 +1,6 @@
-"""BƯỚC 3d — audit ledger append-only, tamper-evident (10').
+"""CP3e — audit ledger append-only, tamper-evident.
 
-JSONL, mỗi tool call một dòng. Đọc CHECKPOINTS.md (§3d).
+JSONL, mỗi tool call một dòng. Đọc CHECKPOINTS.md (§3e).
 
 Interface bắt buộc (tests/test_ledger.py và agent/runner.py gọi trực tiếp):
 
@@ -61,4 +61,28 @@ def append(entry: dict, path: Path) -> dict:
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return False
+
+    previous_hash = "0" * 64
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(record, dict):
+            return False
+        reason = record.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            return False
+        if record.get("prev_hash") != previous_hash:
+            return False
+        stored_hash = record.pop("hash", None)
+        payload = json.dumps(record, sort_keys=True, ensure_ascii=False)
+        expected_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if stored_hash != expected_hash:
+            return False
+        previous_hash = stored_hash
+    return True
